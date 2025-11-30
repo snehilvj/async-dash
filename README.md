@@ -57,7 +57,10 @@ app.layout = html.Div([
     prevent_initial_call=True,
 )
 async def async_callback(n_clicks):
-    """Async callback that simulates a slow async operation (e.g., API call, DB query)."""
+    """Async callback that simulates a slow async operation.
+
+    This could be an API call, a database query, etc.
+    """
     start = time.time()
     # This is non-blocking - other requests can be processed during this sleep
     await asyncio.sleep(2)
