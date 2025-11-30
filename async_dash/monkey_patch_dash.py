@@ -1,30 +1,19 @@
 import asyncio
-import inspect
 import mimetypes
 import pkgutil
 import sys
+from contextvars import copy_context
 
 import dash
 import flask
 import quart
-from dash import _validate
-from dash._grouping import map_grouping, grouping_len
-from dash._utils import inputs_to_dict, split_callback_id, inputs_to_vals
+from dash import _callback, _validate
+from dash._utils import inputs_to_vals
+from dash.dash import with_app_context_async
+from dash.exceptions import DuplicateCallback
 from dash.fingerprint import check_fingerprint
-from quart.utils import run_sync
 
 
-# borrowed from dash-devices
-def exception_handler(loop, context):
-    if "future" in context:
-        task = context["future"]
-        exception = context["exception"]
-        # Route the exception through sys.excepthook
-        sys.excepthook(exception.__class__, exception, exception.__traceback__)
-
-
-# pylint: disable=too-many-instance-attributes
-# pylint: disable=too-many-arguments, too-many-locals
 class Dash(dash.Dash):
     server: quart.Quart
 
@@ -62,114 +51,94 @@ class Dash(dash.Dash):
             request_etag = quart.request.headers.get("If-None-Match")
 
             if '"{}"'.format(tag) == request_etag:
-                response = quart.Response("", status=304)
+                response = quart.Response(None, status=304)
 
         return response
 
-    async def dispatch(self):
-        body = await quart.request.get_json()
-        quart.g.inputs_list = inputs = body.get(  # pylint: disable=assigning-non-slot
-            "inputs", []
-        )
-        quart.g.states_list = state = body.get(  # pylint: disable=assigning-non-slot
-            "state", []
-        )
-        output = body["output"]
-        outputs_list = body.get("outputs") or split_callback_id(output)
-        quart.g.outputs_list = outputs_list  # pylint: disable=assigning-non-slot
+    def setup_apis(self):
+        """
+        Register API endpoints for all callbacks defined using `dash.callback`.
 
-        quart.g.input_values = (  # pylint: disable=assigning-non-slot
-            input_values
-        ) = inputs_to_dict(inputs)
-        quart.g.state_values = inputs_to_dict(  # pylint: disable=assigning-non-slot
-            state
-        )
-        changed_props = body.get("changedPropIds", [])
-        quart.g.triggered_inputs = [  # pylint: disable=assigning-non-slot
-            {"prop_id": x, "value": input_values.get(x)} for x in changed_props
-        ]
+        This method must be called after all callbacks are registered and before the app is served.
+        It ensures that all callback API routes are available for the Dash app to function correctly.
 
-        response = (
-            quart.g.dash_response  # pylint: disable=assigning-non-slot
-        ) = quart.Response("", mimetype="application/json")
+        Typical usage:
+            app = Dash(__name__)
+            # Register callbacks here
+            app.setup_apis()
+            app.run()
 
-        args = inputs_to_vals(inputs + state)
-
-        try:
-            cb = self.callback_map[output]
-            func = cb["callback"]
-
-            # Add args_grouping
-            inputs_state_indices = cb["inputs_state_indices"]
-            inputs_state = inputs + state
-            args_grouping = map_grouping(
-                lambda ind: inputs_state[ind], inputs_state_indices
-            )
-            quart.g.args_grouping = args_grouping  # pylint: disable=assigning-non-slot
-            quart.g.using_args_grouping = (  # pylint: disable=assigning-non-slot
-                not isinstance(inputs_state_indices, int)
-                and (
-                    inputs_state_indices
-                    != list(range(grouping_len(inputs_state_indices)))
+        If not called, callback endpoints will not be available and the app will not function as expected.
+        """
+        for k in list(_callback.GLOBAL_API_PATHS):
+            if k in self.callback_api_paths:
+                raise DuplicateCallback(
+                    f"The callback `{k}` provided with `dash.callback` was already "
+                    "assigned with `app.callback`."
                 )
-            )
+            self.callback_api_paths[k] = _callback.GLOBAL_API_PATHS.pop(k)
 
-            # Add outputs_grouping
-            outputs_indices = cb["outputs_indices"]
-            if not isinstance(outputs_list, list):
-                flat_outputs = [outputs_list]
+        # In Quart, all handlers need to be async since request.get_json() is async
+        def make_parse_body_sync(func):
+            """Wrap a sync function in an async handler for Quart."""
+
+            async def _parse_body():
+                if quart.request.is_json:
+                    data = await quart.request.get_json()
+                    return quart.jsonify(func(**data))
+                return quart.jsonify({})
+
+            return _parse_body
+
+        def make_parse_body_async(func):
+            """Wrap an async function in an async handler for Quart."""
+
+            async def _parse_body_async():
+                if quart.request.is_json:
+                    data = await quart.request.get_json()
+                    result = await func(**data)
+                    return quart.jsonify(result)
+                return quart.jsonify({})
+
+            return _parse_body_async
+
+        for path, func in self.callback_api_paths.items():
+            if asyncio.iscoroutinefunction(func):
+                self._add_url(path, make_parse_body_async(func), ["POST"])
             else:
-                flat_outputs = outputs_list
+                self._add_url(path, make_parse_body_sync(func), ["POST"])
 
-            outputs_grouping = map_grouping(
-                lambda ind: flat_outputs[ind], outputs_indices
-            )
-            quart.g.outputs_grouping = (  # pylint: disable=assigning-non-slot
-                outputs_grouping
-            )
-            quart.g.using_outputs_grouping = (  # pylint: disable=assigning-non-slot
-                not isinstance(outputs_indices, int)
-                and outputs_indices != list(range(grouping_len(outputs_indices)))
-            )
+    @with_app_context_async
+    async def async_dispatch(self):
+        body = await quart.request.get_json()
+        g = self._initialize_context(body)
+        func = self._prepare_callback(g, body)
+        args = inputs_to_vals(g.inputs_list + g.states_list)
 
-        except KeyError as missing_callback_function:
-            msg = "Callback function not found for output '{}', perhaps you forgot to prepend the '@'?"
-            raise KeyError(msg.format(output)) from missing_callback_function
-        if inspect.iscoroutinefunction(func):
-            output = await func(*args, outputs_list=outputs_list)
+        ctx = copy_context()
+        partial_func = self._execute_callback(func, args, g.outputs_list, g)
+        if asyncio.iscoroutinefunction(func):
+            response_data = await ctx.run(partial_func)
         else:
-            output = run_sync(func)(*args, outputs_list=outputs_list)
-        response.set_data(output)
-        return response
+            response_data = ctx.run(partial_func)
 
-    def run_server(self, *args, **kwargs):
-        loop = asyncio.get_event_loop()
-        loop.set_exception_handler(exception_handler)
-        if kwargs.get("debug", False):
-            self.logger.warning(
-                "Currently, `debug` mode in not supported in async-dash."
-            )
-            kwargs["debug"] = False
-        return super().run_server(*args, **kwargs, loop=loop)
+        if asyncio.iscoroutine(response_data):
+            response_data = await response_data
 
-    async def serve_layout(self):
-        return super().serve_layout()
-
-    async def serve_reload_hash(self):
-        return super().serve_reload_hash()
-
-    async def index(self, *args, **kwargs):
-        return super().index(*args, **kwargs)
-
-    async def dependencies(self):
-        return super().dependencies()
-
-    async def _serve_default_favicon(self):
-        return super()._serve_default_favicon()
+        g.dash_response.set_data(response_data)
+        return g.dash_response
 
 
 def apply():
-    flask.Flask = quart.Quart
-    flask.Blueprint = quart.Blueprint
-    flask.jsonify = quart.jsonify
-    flask.Response = quart.Response
+    flask.Flask = quart.Quart  # type: ignore
+    flask.Blueprint = quart.Blueprint  # type: ignore
+    flask.jsonify = quart.jsonify  # type: ignore
+    flask.Response = quart.Response  # type: ignore
+    flask.request = quart.request  # type: ignore
+    flask.has_request_context = quart.has_request_context  # type: ignore
+    flask.g = quart.g  # type: ignore
+    flask.helpers = quart.helpers  # type: ignore
+    flask.current_app = quart.current_app  # type: ignore
+    flask.url_for = quart.url_for  # type: ignore
+    flask.abort = quart.abort  # type: ignore
+    flask.redirect = quart.redirect  # type: ignore

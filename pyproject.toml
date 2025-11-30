@@ -1,13 +1,9 @@
-[tool.poetry]
+[project]
 name = "async-dash"
-version = "0.1.0a1"
+version = "0.1.0"
 description = "Async port of the official Plotly Dash library"
-authors = ["Snehil Vijay <snehilvj@outlook.com>"]
-license = "MIT"
+requires-python = ">=3.12"
 readme = "README.md"
-homepage = "https://github.com/snehilvj/async-dash"
-repository = "https://github.com/snehilvj/async-dash"
-documentation = "https://github.com/snehilvj/async-dash"
 keywords = ["dash", "plotly", "async", "quart", "flask"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -32,15 +28,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: Software Development :: Widget Sets",
 ]
+dependencies = ["dash[async]>=3.3.0", "quart>=0.20.0"]
 
-[tool.poetry.dependencies]
-python = ">=3.7"
-dash = "^2.2.0"
-quart = "^0.16.3"
-
-[tool.poetry.dev-dependencies]
-black = "^22.1.0"
+[dependency-groups]
+dev = ["ruff>=0.14.7", "ty>=0.0.1a29"]
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["async_dash"]
